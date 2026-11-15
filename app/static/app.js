@@ -128,7 +128,8 @@
     entries.forEach(function (item) {
       var opt = document.createElement('option');
       opt.value = item.key;
-      opt.textContent = item.key + (item.published ? '' : '（未发布）');
+      opt.textContent = item.key + (item.published ? '' : '（未发布）') +
+        (item.decom_state === 'transitioning' ? '（撤场中）' : item.decom_state === 'decommissioned' ? '（已撤场）' : '');
       select.appendChild(opt);
     });
 
@@ -148,8 +149,13 @@
         ? '<div class="alert alert-error" style="margin-top:8px">表达式里有不可解析引用：' +
           (result.unresolved || []).map(function (item) { return esc(item.target) + '（' + esc(item.reason) + '）'; }).join('、') + '</div>'
         : '';
+      var decomBlock = (result.decommissioning || []).length
+        ? '<div class="alert alert-error" style="margin-top:8px">表达式引用了撤场过渡中/已撤场的版本（新引用会被拒绝）：' +
+          (result.decommissioning || []).map(function (item) { return esc(item.target) + '（' + esc(item.state) + '）'; }).join('、') + '</div>'
+        : '';
       parseHost.innerHTML =
         unresolvedBlock +
+        decomBlock +
         '<table class="dense"><tbody>' +
         '<tr><th style="width:96px">原始</th><td class="mono small">' + esc(result.raw) + '</td></tr>' +
         '<tr><th>归一化</th><td class="mono small"><strong>' + esc(result.normalized) + '</strong> ' +
@@ -381,6 +387,89 @@
           ' · 发布被阻断</strong>（HTTP ' + esc(err.status) + '）' +
           (blockers ? '<ul class="list small" style="margin:4px 0 0">' + blockers + '</ul>' : '<div>' + esc(err.message || '') + '</div>') +
           '</div>';
+      }
+    });
+  });
+
+  // ---------------------------------------------------------------- 复核页：撤场过渡
+  function decomReload(message) {
+    var host = qs('#decom-out');
+    if (host) host.innerHTML = '<div class="alert alert-info">' + message + '，正在刷新…</div>';
+    setTimeout(function () { location.reload(); }, 650);
+  }
+
+  var acceptButton = qs('#btn-decom-accept');
+  if (acceptButton) {
+    acceptButton.addEventListener('click', async function () {
+      var errorHost = qs('#decom-error');
+      clearError(errorHost);
+      var target = qs('#decom-target').value.split('@');
+      try {
+        var result = await postJSON('/api/decommission', {
+          name: target[0],
+          version: parseInt(target[1], 10),
+          reason: qs('#decom-reason').value,
+          operator: qs('#decom-operator').value
+        });
+        decomReload('已受理撤场 <strong>' + esc(result.record.key) + '</strong>：待迁清单 ' +
+          esc(result.record.pending_count) + ' 项' + (result.deduplicated ? '（幂等命中既有记录）' : ''));
+      } catch (err) {
+        showError(errorHost, err);
+      }
+    });
+  }
+
+  qsa('.btn-decom-prefill').forEach(function (button) {
+    button.addEventListener('click', function () {
+      var select = qs('#decom-target');
+      if (select) select.value = button.getAttribute('data-name') + '@' + button.getAttribute('data-version');
+      var panel = qs('#decommission-panel');
+      if (panel) panel.scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+
+  qsa('.btn-decom-migrate').forEach(function (button) {
+    button.addEventListener('click', async function () {
+      var errorHost = qs('#decom-error');
+      clearError(errorHost);
+      var id = button.getAttribute('data-decom');
+      try {
+        var result = await postJSON('/api/decommission/migrate', {
+          target_name: button.getAttribute('data-target-name'),
+          target_version: parseInt(button.getAttribute('data-target-version'), 10),
+          name: qs('#migrate-name-' + id).value,
+          expression: qs('#migrate-expression-' + id).value
+        });
+        decomReload(result.already_migrated
+          ? '该指标已迁过（幂等命中），未重复登记版本'
+          : '已迁移并发布 <strong>' + esc(result.new_key) + '</strong>');
+      } catch (err) {
+        showError(errorHost, err);
+      }
+    });
+  });
+
+  qsa('.btn-decom-finalize').forEach(function (button) {
+    button.addEventListener('click', async function () {
+      if (!window.confirm('确认待迁清单已清空，一次性切换为已撤场？旧版本将停止取数（历史快照保留）。')) return;
+      var errorHost = qs('#decom-error');
+      clearError(errorHost);
+      try {
+        var result = await postJSON('/api/decommission/finalize', {
+          name: button.getAttribute('data-name'),
+          version: parseInt(button.getAttribute('data-version'), 10)
+        });
+        decomReload('<strong>' + esc(result.record.key) + '</strong> 已撤场' +
+          (result.already ? '（幂等命中既有终态）' : ''));
+      } catch (err) {
+        var detail = err.data && err.data.detail;
+        var pending = detail && detail.pending ? detail.pending : [];
+        showError(errorHost, err);
+        if (pending.length) {
+          errorHost.innerHTML += '<ul class="list small" style="margin:4px 0 0">' +
+            pending.map(function (item) { return '<li>' + esc(item.key) + '（深度 L' + esc(item.depth) + '）</li>'; }).join('') +
+            '</ul>';
+        }
       }
     });
   });

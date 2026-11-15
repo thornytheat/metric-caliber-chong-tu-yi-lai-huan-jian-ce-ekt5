@@ -29,25 +29,32 @@ class ExpressionInvalid(GateError):
 
 
 def _resolve(ref: dict, metrics: list[dict], index: dict, published: dict) -> dict:
-    """把一次引用解析成 {'ref','target','reason','published'}。"""
+    """把一次引用解析成 {'ref','target','reason','published','decom_state'}。"""
     name = ref["name"]
     version = ref["version"]
     if version is not None:
         key = graph_mod.node_key(name, version)
         target = index.get((name, version))
         if target is None:
-            return {"ref": ref, "target": key, "reason": "version_not_found", "published": None}
-        return {"ref": ref, "target": key, "reason": None, "published": bool(target["published"])}
+            return {"ref": ref, "target": key, "reason": "version_not_found", "published": None, "decom_state": None}
+        return {
+            "ref": ref,
+            "target": key,
+            "reason": None,
+            "published": bool(target["published"]),
+            "decom_state": target.get("decom_state"),
+        }
     latest = published.get(name)
     if latest is None:
         names = {metric["name"] for metric in metrics}
         reason = "no_published_version" if name in names else "metric_not_found"
-        return {"ref": ref, "target": name, "reason": reason, "published": None}
+        return {"ref": ref, "target": name, "reason": reason, "published": None, "decom_state": None}
     return {
         "ref": ref,
         "target": graph_mod.node_key(name, latest["version"]),
         "reason": None,
         "published": True,
+        "decom_state": latest.get("decom_state"),
     }
 
 
@@ -210,13 +217,16 @@ def change_impact(
     upstream_keys = {item["key"] for item in graph_mod.upstream(patched_graph, key)}
     cycle_upstream = sorted(upstream_keys & cycle_members)
 
-    # 新表达式里引用了未发布/不存在的版本
+    # 新表达式里引用了未发布/不存在/撤场中的版本
     published = registry.latest_published(patched)
     unpublished_refs = []
     missing_refs = []
+    decommissioning_refs = []
     for ref in analysis["metrics"]:
         resolved = _resolve(ref, patched, registry.index_by_key(patched), published)
-        if resolved["published"] is False:
+        if resolved.get("decom_state") in ("transitioning", "decommissioned"):
+            decommissioning_refs.append(resolved["target"])
+        elif resolved["published"] is False:
             unpublished_refs.append(resolved["target"])
         elif resolved["reason"] in ("version_not_found", "metric_not_found", "no_published_version"):
             missing_refs.append(resolved["target"])
@@ -251,6 +261,7 @@ def change_impact(
                 )
             ),
             unpublished_refs=unpublished_refs,
+            decommissioning_refs=decommissioning_refs,
         )
         entry.update(verdict)
         if verdict["code"] == "requires_sync":
@@ -292,6 +303,7 @@ def change_impact(
         "requires_sync_count": len(requires_sync),
         "unpublished_refs": unpublished_refs,
         "missing_refs": missing_refs,
+        "decommissioning_refs": decommissioning_refs,
         "cycle_introduced": cycle_introduced,
         "cycle_is_new": cycle_is_new,
         "cycle_upstream": cycle_upstream,
@@ -304,6 +316,7 @@ def change_impact(
             missing_refs=missing_refs,
             cycle_paths=cycle_paths,
             cycle_upstream=cycle_upstream,
+            decommissioning_refs=decommissioning_refs,
         ),
     }
 
@@ -316,6 +329,7 @@ def _verdict(
     cycle_blocked: bool,
     cycle_reason: str,
     unpublished_refs: list[str],
+    decommissioning_refs: list[str],
 ) -> dict:
     """对单个下游给出 breaking 或 requires_sync 的判定与依据。"""
     if cycle_blocked:
@@ -343,6 +357,12 @@ def _verdict(
             ),
             "evidence": f"removed_dims={hit}; downstream_dims={entry['dimensions']}",
         }
+    if decommissioning_refs:
+        return {
+            "code": "decommissioning_reference",
+            "reason": "新表达式引用了撤场过渡中/已撤场的版本：" + "、".join(decommissioning_refs),
+            "evidence": "、".join(decommissioning_refs),
+        }
     if unpublished_refs:
         return {
             "code": "unpublished_reference",
@@ -364,6 +384,7 @@ def _impact_notes(
     missing_refs: list[str],
     cycle_paths: list[list[str]],
     cycle_upstream: list[str],
+    decommissioning_refs: list[str] | None = None,
 ) -> list[str]:
     notes = []
     if not changed:
@@ -373,6 +394,8 @@ def _impact_notes(
         notes.append("新表达式引用了不存在的指标：" + "、".join(missing_refs))
     if unpublished_refs:
         notes.append("新表达式引用了未发布版本：" + "、".join(unpublished_refs))
+    if decommissioning_refs:
+        notes.append("新表达式引用了撤场过渡中/已撤场的版本：" + "、".join(decommissioning_refs))
     if cycle_paths:
         notes.append("改动后会形成依赖环：" + " → ".join(cycle_paths[0]))
     if cycle_upstream:
@@ -399,7 +422,19 @@ def publish_check(metrics: list[dict], name: str, version: int) -> dict:
         )
 
     for finding in reference_findings(target, metrics):
-        if finding["published"] is False:
+        state = finding.get("decom_state")
+        if state in ("transitioning", "decommissioned"):
+            blockers.append(
+                {
+                    "code": "decommissioning_reference",
+                    "detail": (
+                        f"依赖 {finding['target']} 正在撤场过渡中，不再接受新引用，请改用替代版本"
+                        if state == "transitioning"
+                        else f"依赖 {finding['target']} 已撤场，不能再引用"
+                    ),
+                }
+            )
+        elif finding["published"] is False:
             blockers.append(
                 {
                     "code": "unpublished_reference",

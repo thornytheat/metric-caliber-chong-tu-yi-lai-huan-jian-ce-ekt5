@@ -26,7 +26,7 @@ def fingerprint(payload: dict) -> str:
     ).hexdigest()[:12]
 
 
-def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
+def build_check(metrics: list[dict], check_id: str | None = None, decommissions: list[dict] | None = None) -> dict:
     graph = graph_mod.build_graph(metrics)
     cycles = graph_mod.find_cycles(graph)
     conflicts = conflict.detect_conflicts(metrics)
@@ -37,6 +37,7 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
 
     published = [metric for metric in metrics if metric["published"]]
     unpublished = [metric for metric in metrics if not metric["published"]]
+    decom_list = decommissions or []
 
     stats = {
         "metric_entries": len(metrics),
@@ -51,6 +52,8 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
         "unresolved_count": len(graph.unresolved),
         "cross_version_count": len(cross),
         "same_caliber_duplicate_count": len(duplicates),
+        "decommissioning_count": sum(1 for metric in metrics if metric.get("decom_state") == "transitioning"),
+        "decommissioned_count": sum(1 for metric in metrics if metric.get("decom_state") == "decommissioned"),
         "max_depth": summary["max_depth"],
         "max_depth_node": summary["max_depth_node"],
     }
@@ -83,6 +86,7 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
         "cross_version": cross,
         "unresolved": graph.unresolved,
         "same_caliber_duplicates": duplicates,
+        "decommissions": decom_list,
         "graph_summary": summary,
         "metrics": [
             {
@@ -145,6 +149,8 @@ def overview(metrics: list[dict]) -> dict:
         "publish_blocked_count": len(blockers),
         "unresolved_count": summary["unresolved_count"],
         "cross_version_count": len(cross),
+        "decommissioning_count": sum(1 for metric in metrics if metric.get("decom_state") == "transitioning"),
+        "decommissioned_count": sum(1 for metric in metrics if metric.get("decom_state") == "decommissioned"),
         "max_depth": summary["max_depth"],
         "max_depth_node": summary["max_depth_node"],
         "conflicts": conflicts,

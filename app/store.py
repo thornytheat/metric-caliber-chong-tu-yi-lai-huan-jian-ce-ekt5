@@ -46,6 +46,19 @@ CREATE TABLE IF NOT EXISTS events (
     summary TEXT NOT NULL,
     detail  TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS decommissions (
+    decom_id    TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    state       TEXT NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    operator    TEXT NOT NULL DEFAULT '',
+    snapshot    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(name, version)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -285,3 +298,89 @@ def list_events(conn: sqlite3.Connection, limit: int = 40) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------- 撤场记录
+#
+# decommissions 表是撤场过渡的唯一事实来源：
+#   - UNIQUE(name, version) 保证同一指标版本只有一条撤场记录，重试物理上无法重复生成；
+#   - snapshot 存受理时的指标行与待迁清单（旧版结果），中断/重启后过渡现场可完整恢复；
+#   - state: transitioning（过渡中）→ decommissioned（已撤场），只允许单向前进。
+
+
+def _row_to_decommission(row: sqlite3.Row) -> dict:
+    return {
+        "decom_id": row["decom_id"],
+        "name": row["name"],
+        "version": int(row["version"]),
+        "state": row["state"],
+        "reason": row["reason"],
+        "operator": row["operator"],
+        "snapshot": json.loads(row["snapshot"] or "{}"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def insert_decommission(conn: sqlite3.Connection, record: dict) -> bool:
+    """写入撤场记录；同版本已存在则什么都不做（幂等）。返回是否真正插入。"""
+    cursor = conn.execute(
+        """
+        INSERT INTO decommissions (decom_id, name, version, state, reason, operator,
+                                   snapshot, created_at, updated_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name, version) DO NOTHING
+        """,
+        (
+            record["decom_id"],
+            record["name"],
+            int(record["version"]),
+            record["state"],
+            record.get("reason", ""),
+            record.get("operator", ""),
+            json.dumps(record.get("snapshot") or {}, ensure_ascii=False),
+            record["created_at"],
+            record["updated_at"],
+            record.get("finished_at"),
+        ),
+    )
+    return cursor.rowcount > 0
+
+
+def get_decommission(conn: sqlite3.Connection, name: str, version: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM decommissions WHERE name = ? AND version = ?", (name, int(version))
+    ).fetchone()
+    return _row_to_decommission(row) if row else None
+
+
+def list_decommissions(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM decommissions ORDER BY created_at DESC, rowid DESC"
+    ).fetchall()
+    return [_row_to_decommission(row) for row in rows]
+
+
+def update_decommission_snapshot(
+    conn: sqlite3.Connection, decom_id: str, snapshot: dict, now: str
+) -> None:
+    conn.execute(
+        "UPDATE decommissions SET snapshot = ?, updated_at = ? WHERE decom_id = ?",
+        (json.dumps(snapshot, ensure_ascii=False), now, decom_id),
+    )
+
+
+def finalize_decommission(
+    conn: sqlite3.Connection, decom_id: str, snapshot: dict, finished_at: str, now: str
+) -> bool:
+    """一次性切换为已撤场。WHERE state='transitioning' 让并发/重试只生效一次。"""
+    cursor = conn.execute(
+        """
+        UPDATE decommissions
+        SET state = 'decommissioned', snapshot = ?, finished_at = ?, updated_at = ?
+        WHERE decom_id = ? AND state = 'transitioning'
+        """,
+        (json.dumps(snapshot, ensure_ascii=False), finished_at, now, decom_id),
+    )
+    return cursor.rowcount > 0

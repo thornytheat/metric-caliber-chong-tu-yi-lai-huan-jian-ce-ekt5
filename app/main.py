@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import conflict, expr, gate, graph as graph_mod, registry, report, seed, settings, store
+from . import conflict, decommission, expr, gate, graph as graph_mod, registry, report, seed, settings, store
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -32,6 +32,8 @@ def load_metrics() -> list[dict]:
     with store.session() as conn:
         store.init_schema(conn)
         metrics = store.all_metrics(conn)
+        records = store.list_decommissions(conn)
+    metrics = decommission.annotate_metrics(metrics, records)
     return [registry.with_normalized(metric) for metric in metrics]
 
 
@@ -82,6 +84,29 @@ class RegistryRequest(BaseModel):
     description: str = ""
     published: bool = False
     allow_missing_reference: bool = False
+
+
+class DecommissionRequest(BaseModel):
+    name: str
+    version: int
+    reason: str = ""
+    operator: str = ""
+
+
+class DecommissionMigrateRequest(BaseModel):
+    target_name: str
+    target_version: int
+    name: str
+    expression: str
+    aggregation: str | None = None
+    dimensions: list[str] | None = None
+    unit: str | None = None
+    owner: str | None = None
+
+
+class DecommissionFinalizeRequest(BaseModel):
+    name: str
+    version: int
 
 
 # --------------------------------------------------------------------------- 页面
@@ -139,6 +164,7 @@ def workbench(request: Request) -> HTMLResponse:
                 "unit": metric["unit"],
                 "published": metric["published"],
                 "owner": metric["owner"],
+                "decom_state": metric.get("decom_state"),
             }
             for metric in registry.versions_of(metrics, name)
         ]
@@ -204,6 +230,7 @@ def review(request: Request) -> HTMLResponse:
         impact = store.latest_impact(conn)
         events = store.list_events(conn, limit=25)
         checks = store.list_checks(conn, limit=8)
+        decom_records = store.list_decommissions(conn)
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
@@ -213,6 +240,7 @@ def review(request: Request) -> HTMLResponse:
         "impact": impact,
         "events": events,
         "checks": checks,
+        "decom_records": [decommission.enrich_record(record, metrics) for record in decom_records],
         "error": None,
         "notice": None,
         "page": "review",
@@ -240,6 +268,8 @@ def api_registry() -> dict:
             "publish_blocked_count": overview["publish_blocked_count"],
             "unresolved_count": overview["unresolved_count"],
             "cross_version_count": overview["cross_version_count"],
+            "decommissioning_count": overview["decommissioning_count"],
+            "decommissioned_count": overview["decommissioned_count"],
         },
         "metrics": [
             {
@@ -253,6 +283,7 @@ def api_registry() -> dict:
                 "dimensions": metric["dimensions"],
                 "owner": metric["owner"],
                 "published": metric["published"],
+                "decom_state": metric.get("decom_state"),
             }
             for metric in metrics
         ],
@@ -287,16 +318,31 @@ def api_register(payload: RegistryRequest) -> JSONResponse:
 
     analysis = expr.analyze_expression(payload.expression)
     unknown_dims = _unknown_dimensions(analysis, metrics)
+    findings = gate.reference_findings(metric, metrics)
+    decommissioning_refs = [
+        {"target": finding["target"], "state": finding["decom_state"]}
+        for finding in findings
+        if finding.get("decom_state") in decommission.ACTIVE_STATES
+    ]
     missing_refs = [
         finding["target"]
-        for finding in gate.reference_findings(metric, metrics)
+        for finding in findings
         if finding["reason"] in ("version_not_found", "metric_not_found", "no_published_version")
     ]
     unpublished_refs = [
         finding["target"]
-        for finding in gate.reference_findings(metric, metrics)
-        if finding["published"] is False
+        for finding in findings
+        if finding["published"] is False and not finding.get("decom_state")
     ]
+    if decommissioning_refs:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "表达式引用了撤场过渡中/已撤场的版本，新引用一律拒绝",
+                "decommissioning_references": decommissioning_refs,
+                "field": "expression",
+            },
+        )
     if missing_refs and not payload.allow_missing_reference:
         raise HTTPException(
             status_code=400,
@@ -386,8 +432,16 @@ def api_parse(payload: ParseRequest = Body(default=ParseRequest())) -> JSONRespo
     index = registry.index_by_key(metrics)
     published = registry.latest_published(metrics)
     unresolved = []
+    decommissioning = []
     for ref in analysis["metrics"]:
         resolved = gate._resolve(ref, metrics, index, published)
+        if resolved.get("decom_state") in decommission.ACTIVE_STATES:
+            decommissioning.append(
+                {
+                    "target": resolved["target"],
+                    "state": resolved["decom_state"],
+                }
+            )
         if resolved["reason"] or resolved["published"] is False:
             unresolved.append(
                 {
@@ -396,10 +450,15 @@ def api_parse(payload: ParseRequest = Body(default=ParseRequest())) -> JSONRespo
                     "published": resolved["published"],
                 }
             )
-    if unresolved and payload.strict:
+    if (unresolved or decommissioning) and payload.strict:
         return JSONResponse(
             status_code=400,
-            content={"ok": False, "error": "表达式引用了不可解析的指标", "unresolved": unresolved},
+            content={
+                "ok": False,
+                "error": "表达式引用了不可解析或已撤场的指标",
+                "unresolved": unresolved,
+                "decommissioning": decommissioning,
+            },
         )
     return JSONResponse(
         content={
@@ -412,13 +471,18 @@ def api_parse(payload: ParseRequest = Body(default=ParseRequest())) -> JSONRespo
             "dims": [ref["name"] for ref in analysis["dims"]],
             "functions": analysis["functions"],
             "unresolved": unresolved,
+            "decommissioning": decommissioning,
         }
     )
 
 
 def _run_and_store_check() -> dict:
     metrics = load_metrics()
-    payload = report.build_check(metrics)
+    with store.session() as conn:
+        store.init_schema(conn)
+        records = store.list_decommissions(conn)
+    decom_list = [decommission.enrich_record(record, metrics) for record in records]
+    payload = report.build_check(metrics, decommissions=decom_list)
     now = report.now_iso()
     with store.session() as conn:
         store.init_schema(conn)
@@ -515,6 +579,142 @@ def api_publish(payload: PublishRequest) -> JSONResponse:
     return JSONResponse(status_code=200, content=result)
 
 
+# --------------------------------------------------------------------------- 撤场（可审查过渡）
+
+
+@app.post("/api/decommission", status_code=201)
+def api_decommission_accept(payload: DecommissionRequest) -> JSONResponse:
+    """受理撤场：进入过渡中。幂等 —— 同版本重试返回既有记录，不重复生成。"""
+    metrics = load_metrics()
+    now = report.now_iso()
+    with store.session() as conn:
+        store.init_schema(conn)
+        try:
+            record, created = decommission.accept(
+                conn,
+                metrics,
+                payload.name,
+                int(payload.version),
+                reason=payload.reason,
+                operator=payload.operator,
+                now=now,
+            )
+        except decommission.TargetNotFound as exc:
+            raise HTTPException(status_code=404, detail={"error": exc.message})
+        enriched = decommission.enrich_record(record, metrics)
+        if record["state"] == decommission.STATE_DECOMMISSIONED:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": f"{payload.name}@{payload.version} 已撤场，撤场记录不可重复生成",
+                    "record": enriched,
+                },
+            )
+        return JSONResponse(
+            status_code=201 if created else 200,
+            content={"ok": True, "deduplicated": not created, "record": enriched},
+        )
+
+
+@app.get("/api/decommission")
+def api_decommission_list() -> dict:
+    """全部撤场记录（含实时待迁清单）：中断/重启后的过渡现场从这里恢复。"""
+    metrics = load_metrics()
+    with store.session() as conn:
+        store.init_schema(conn)
+        records = store.list_decommissions(conn)
+    enriched = [decommission.enrich_record(record, metrics) for record in records]
+    return {"count": len(enriched), "records": enriched}
+
+
+@app.post("/api/decommission/migrate", status_code=201)
+def api_decommission_migrate(payload: DecommissionMigrateRequest) -> JSONResponse:
+    """迁移并发布：为待迁指标登记不再引用目标版本的新版本。单事务，重试幂等。"""
+    metrics = load_metrics()
+    now = report.now_iso()
+    with store.session() as conn:
+        store.init_schema(conn)
+        try:
+            result = decommission.migrate(
+                conn,
+                metrics,
+                payload.target_name,
+                int(payload.target_version),
+                payload.name,
+                payload.expression,
+                aggregation=payload.aggregation,
+                dimensions=payload.dimensions,
+                unit=payload.unit,
+                owner=payload.owner,
+                now=now,
+            )
+        except decommission.RecordNotFound as exc:
+            raise HTTPException(status_code=404, detail={"error": exc.message})
+        except decommission.NotTransitioning as exc:
+            raise HTTPException(status_code=409, detail={"error": exc.message})
+        except decommission.NotInPendingList as exc:
+            raise HTTPException(status_code=400, detail={"error": exc.message})
+        except registry.RegistryError as exc:
+            raise HTTPException(status_code=400, detail={"error": exc.message, "field": exc.field})
+        except decommission.MigrationRejected as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": exc.message, "problems": exc.problems}
+            )
+        except decommission.MigrationBlocked as exc:
+            raise HTTPException(
+                status_code=409, detail={"error": exc.message, "blockers": exc.blockers}
+            )
+        return JSONResponse(
+            status_code=200 if result["already_migrated"] else 201, content=result
+        )
+
+
+@app.post("/api/decommission/finalize")
+def api_decommission_finalize(payload: DecommissionFinalizeRequest) -> JSONResponse:
+    """待迁清单清空后一次性切换为已撤场。重试返回既有终态，不重复写记录。"""
+    metrics = load_metrics()
+    now = report.now_iso()
+    with store.session() as conn:
+        store.init_schema(conn)
+        try:
+            record, flipped = decommission.finalize(
+                conn, metrics, payload.name, int(payload.version), now=now
+            )
+        except decommission.RecordNotFound as exc:
+            raise HTTPException(status_code=404, detail={"error": exc.message})
+        except decommission.PendingNotEmpty as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "error": exc.message,
+                    "pending": exc.pending,
+                    "record": decommission.enrich_record(exc.record, metrics),
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "already": not flipped,
+                "record": decommission.enrich_record(record, metrics),
+            },
+        )
+
+
+@app.get("/api/decommission/{name}/{version}")
+def api_decommission_detail(name: str, version: int) -> dict:
+    """单条撤场记录：快照（旧版结果）+ 实时待迁清单 + 迁移日志。"""
+    metrics = load_metrics()
+    with store.session() as conn:
+        store.init_schema(conn)
+        record = store.get_decommission(conn, name, int(version))
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"{name}@{version} 没有撤场记录")
+    return decommission.enrich_record(record, metrics)
+
+
 @app.get("/api/metrics")
 def api_metrics() -> dict:
     metrics = load_metrics()
@@ -531,6 +731,7 @@ def api_metrics() -> dict:
                 "aggregation": metric["aggregation"],
                 "dimensions": metric["dimensions"],
                 "published": metric["published"],
+                "decom_state": metric.get("decom_state"),
             }
             for metric in metrics
         ],

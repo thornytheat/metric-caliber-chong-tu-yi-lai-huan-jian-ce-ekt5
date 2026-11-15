@@ -56,12 +56,21 @@
           <td class="nowrap"><strong>{{ metric.name }}</strong>@{{ metric.version }}<span class="sub">{{ metric.owner }} · {{ metric.unit or '—' }}</span></td>
           <td class="mono small cell-ellipsis">{{ metric.normalized }}</td>
           <td class="small nowrap">{{ metric.aggregation }} · {{ metric.dimensions | join(', ') }}</td>
-          <td class="nowrap">{% if metric.published %}<span class="tag ok">已发布</span>{% else %}<span class="tag warn">未发布</span>{% endif %}</td>
           <td class="nowrap">
-            {% if metric.published %}
-            <span class="muted small">—</span>
+            {% if metric.published %}<span class="tag ok">已发布</span>{% else %}<span class="tag warn">未发布</span>{% endif %}
+            {% if metric.decom_state == 'transitioning' %}<span class="tag warn">撤场中</span>{% elif metric.decom_state == 'decommissioned' %}<span class="tag err">已撤场</span>{% endif %}
+          </td>
+          <td class="nowrap">
+            {% if metric.decom_state == 'decommissioned' %}
+            <span class="muted small">已撤场</span>
+            {% elif metric.decom_state == 'transitioning' %}
+            <a class="small" href="#decommission-panel">过渡中</a>
             {% else %}
-            <button type="button" class="secondary small btn-publish" data-name="{{ metric.name }}" data-version="{{ metric.version }}">发布</button>
+              {% if metric.published %}
+              <button type="button" class="secondary small btn-decom-prefill" data-name="{{ metric.name }}" data-version="{{ metric.version }}">撤场</button>
+              {% else %}
+              <button type="button" class="secondary small btn-publish" data-name="{{ metric.name }}" data-version="{{ metric.version }}">发布</button>
+              {% endif %}
             {% endif %}
           </td>
         </tr>
@@ -192,6 +201,140 @@
       </div>
     </section>
     {% endif %}
+
+    <section class="panel" id="decommission-panel">
+      <div class="panel-head">
+        <h2>撤场过渡与待迁清单</h2>
+        <div class="panel-actions">
+          {% set transitioning = decom_records | selectattr('state', 'equalto', 'transitioning') | list %}
+          <span class="tag warn">{{ transitioning | length }} 过渡中</span>
+          <span class="tag">{{ decom_records | length }} 条撤场记录</span>
+        </div>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">受理后新引用立即被拒；已发布公式仍按原版本取数，待迁清单清空后才能一次性切换为「已撤场」。
+          受理/迁移/切换各自单事务落库，失败或中断可恢复现场，重试不会重复生成撤场记录。</p>
+        <div class="toolbar" style="margin-top:8px">
+          <select id="decom-target" aria-label="选择要撤场的指标版本">
+            {% for metric in metrics %}
+            <option value="{{ metric.name }}@{{ metric.version }}" {% if metric.decom_state %}disabled{% endif %}>{{ metric.name }}@{{ metric.version }}{{ '（已发布）' if metric.published else '（未发布）' }}</option>
+            {% endfor %}
+          </select>
+          <input type="text" id="decom-reason" placeholder="撤场原因（如：口径由新版本替代）" style="min-width:220px">
+          <input type="text" id="decom-operator" placeholder="经办人" style="width:110px">
+          <button type="button" id="btn-decom-accept" class="small">受理撤场</button>
+        </div>
+        <div id="decom-error" class="alert alert-error" hidden></div>
+        <div id="decom-out" class="small"></div>
+      </div>
+      {% if not decom_records %}
+      <div class="empty">还没有撤场记录。选择上方指标版本点「受理撤场」，即进入可审查的过渡。</div>
+      {% endif %}
+    </section>
+
+    {% for record in decom_records %}
+    <section class="panel">
+      <div class="panel-head">
+        <h2>撤场单 {{ record.decom_id }} · {{ record.key }}</h2>
+        <div class="panel-actions">
+          {% if record.state == 'transitioning' %}<span class="tag warn">撤场过渡中</span>{% else %}<span class="tag err">已撤场</span>{% endif %}
+          <span class="tag">待迁 {{ record.pending_count }} / {{ record.accept_pending_count }}</span>
+        </div>
+      </div>
+      <div class="panel-body tight">
+        <p class="small" style="margin:0">
+          原因 {{ record.reason or '—' }} · 经办 {{ record.operator or '—' }} · 受理 {{ record.created_at }}
+          {% if record.finished_at %} · 完成 {{ record.finished_at }}{% endif %}
+        </p>
+        <p class="small muted" style="margin:4px 0 0">
+          旧版快照（受理时取数口径）：<code>{{ record.snapshot.metric.normalized }}</code> · 受理时 published={{ record.snapshot.metric.published }}
+          · 已迁 {{ record.cleared_count }} 项 · 迁移日志 {{ record.migrations | length }} 条
+        </p>
+      </div>
+
+      <div class="toolbar">
+        <strong>待迁清单（{{ record.pending_items | length }} 项）</strong>
+        <span class="spacer"></span>
+        <span class="small muted">最新发布版本仍（传递）依赖 {{ record.key }} 的指标；清空后才能切换</span>
+      </div>
+      {% if record.pending_items %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>指标</th><th>现用版本</th><th>负责人</th><th>依赖深度</th><th>归一化口径</th><th>状态</th></tr></thead>
+          <tbody>
+          {% for item in record.pending_items %}
+            <tr>
+              <td><strong>{{ item.name }}</strong></td>
+              <td class="mono small">{{ item.key }}</td>
+              <td class="small">{{ item.owner }}</td>
+              <td class="small">L{{ item.depth }}</td>
+              <td class="mono small cell-ellipsis">{{ item.normalized }}</td>
+              <td>{% if item.cleared %}<span class="tag ok">已迁</span>{% else %}<span class="tag warn">待迁</span>{% endif %}{% if item.source == 'new' %}<span class="tag">受理后新增</span>{% endif %}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty">受理时就没有在用引用，可直接切换为已撤场。</div>
+      {% endif %}
+
+      {% if record.draft_refs %}
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">未发布草稿仍引用（不参与取数，发布时会被门禁拦截）：
+          {% for draft in record.draft_refs %}<code>{{ draft.key }}</code>{% if not loop.last %}、{% endif %}{% endfor %}
+        </p>
+      </div>
+      {% endif %}
+
+      {% if record.migrations %}
+      <div class="toolbar">
+        <strong>迁移日志（{{ record.migrations | length }} 条）</strong>
+        <span class="spacer"></span>
+        <span class="small muted">每条都是一次「登记新版本并发布」的单事务</span>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>时间</th><th>指标</th><th>从</th><th>到</th><th>口径变化</th></tr></thead>
+          <tbody>
+          {% for migration in record.migrations %}
+            <tr>
+              <td class="small muted">{{ migration.at }}</td>
+              <td><strong>{{ migration.name }}</strong></td>
+              <td class="mono small">{{ migration.from_key }}</td>
+              <td class="mono small">{{ migration.to_key }}</td>
+              <td class="mono small cell-ellipsis">{{ migration.from_normalized }} → {{ migration.to_normalized }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      {% if record.state == 'transitioning' %}
+      <div class="panel-body tight">
+        <div class="toolbar">
+          {% if record.pending %}
+          <select id="migrate-name-{{ record.decom_id }}" aria-label="选择待迁指标">
+            {% for item in record.pending %}
+            <option value="{{ item.name }}">{{ item.name }}（现用 {{ item.key }}）</option>
+            {% endfor %}
+          </select>
+          <input type="text" id="migrate-expression-{{ record.decom_id }}" placeholder="迁移后的新表达式（不得再引用 {{ record.key }}）" style="min-width:280px">
+          <button type="button" class="small btn-decom-migrate" data-decom="{{ record.decom_id }}" data-target-name="{{ record.name }}" data-target-version="{{ record.version }}">迁移并发布</button>
+          {% else %}
+          <span class="small ok-text">待迁清单已清空，可以一次性切换。</span>
+          {% endif %}
+          <span class="spacer"></span>
+          <button type="button" class="secondary small btn-decom-finalize" data-name="{{ record.name }}" data-version="{{ record.version }}" {% if not record.finalizable %}disabled{% endif %}>切换已撤场</button>
+        </div>
+        {% if not record.finalizable %}
+        <p class="small muted" style="margin:6px 0 0">待迁清单未清空，「切换已撤场」保持禁用；清空后按钮自动可用。</p>
+        {% endif %}
+      </div>
+      {% endif %}
+    </section>
+    {% endfor %}
 
     <section class="panel">
       <div class="panel-head">
